@@ -7,6 +7,13 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data.sampler import SubsetRandomSampler
+import numpy as np
+from matplotlib import pyplot as plt
+import sklearn
+from sklearn.metrics import confusion_matrix
+from sklearn.manifold import TSNE
+import seaborn
+import pandas as pd
 
 import os
 
@@ -79,14 +86,80 @@ class ConvNet(nn.Module):
 
 class Net(nn.Module):
     '''
-    Build the best MNIST classifier.
+    Build the best MNIST classifier
     '''
     def __init__(self):
         super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=(3,3), stride=1)
+        self.conv2 = nn.Conv2d(8, 8, 5, 1)
+        # self.conv3 = nn.Conv2d(8, 8, 5, 1)
+
+        self.drop1 = nn.Dropout2d(0.5)
+        self.drop2 = nn.Dropout2d(0.5)
+        # self.drop3 = nn.Dropout2d(0.5)
+
+        self.batc1 = nn.BatchNorm2d(8)
+        self.batc2 = nn.BatchNorm2d(8)
+        # self.batc3 = nn.BatchNorm2d(8)
+        
+        self.line1 = nn.Linear(968, 256)
+        self.line2 = nn.Linear(256, 64)
+        self.line3 = nn.Linear(64, 10)
 
     def forward(self, x):
-        return x
+        x = self.conv1(x)
+        x = self.batc1(x)
+        x = F.relu(x)
+        # x = F.max_pool2d(x, 2)
+        x = self.drop1(x)
 
+        x = self.conv2(x)
+        x = self.batc2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.drop2(x)
+
+        # x = self.conv3(x)
+        # x = self.batc3(x)
+        # x = F.relu(x)
+        # x = F.max_pool2d(x, 2)
+        # x = self.drop3(x)
+
+        x = torch.flatten(x, 1)
+        x = self.line1(x)
+        x = F.relu(x)
+        x = self.line2(x)
+        x = F.relu(x)
+        x = self.line3(x)
+
+        output = F.log_softmax(x, dim=1)
+        return output
+
+    def get_feature_vector(self, x):
+        x = self.conv1(x)
+        x = self.batc1(x)
+        x = F.relu(x)
+        # x = F.max_pool2d(x, 2)
+        x = self.drop1(x)
+
+        x = self.conv2(x)
+        x = self.batc2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.drop2(x)
+
+        # x = self.conv3(x)
+        # x = self.batc3(x)
+        # x = F.relu(x)
+        # x = F.max_pool2d(x, 2)
+        # x = self.drop3(x)
+
+        x = torch.flatten(x, 1)
+        x = self.line1(x)
+        x = F.relu(x)
+        x = self.line2(x)
+
+        return x
 
 def train(args, model, device, train_loader, optimizer, epoch):
     '''
@@ -106,29 +179,48 @@ def train(args, model, device, train_loader, optimizer, epoch):
                 epoch, batch_idx * len(data), len(train_loader.sampler),
                 100. * batch_idx / len(train_loader), loss.item()))
 
+    
 
-def test(model, device, test_loader):
+
+def test(model, device, test_loader, method='val', check_failures=False):
+    assert(method in ['train', 'val'])
     model.eval()    # Set the model to inference mode
     test_loss = 0
     correct = 0
     test_num = 0
+    results = []
     with torch.no_grad():   # For the inference step, gradient is not computed
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
             test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
+            flag = pred.eq(target.view_as(pred))
+            correct += flag.sum().item()
             test_num += len(data)
+
+            if check_failures:
+                flag = np.arange(flag.shape[0])[~flag[:, 0]]
+                results.extend([
+                    (data[flag[i], :, :, :], pred[flag[i], 0])
+                    for i in range(flag.shape[0])
+                ])
 
     test_loss /= test_num
 
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+    print('\n{} set: Average loss: {:.4f}, Accuracy: {}/{} ({:.1f}%)\n'.format(
+        'Validation' if method == 'val' else 'Training',
         test_loss, correct, test_num,
         100. * correct / test_num))
 
+    if check_failures:
+        return results
+    return 100. * correct / test_num
+
 
 def main():
+    torch.manual_seed(2022)
+
     # Training settings
     # Use the command line to modify the default settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
@@ -158,6 +250,21 @@ def main():
 
     parser.add_argument('--save-model', action='store_true', default=True,
                         help='For Saving the current Model')
+
+    parser.add_argument('--train-frac', type=float, default=1., metavar='f',
+                        help='Choose the fraction of the training set to use')
+    parser.add_argument('--plot-curves', action='store_true', default=False,
+                        help='Plot the learning curves')
+    parser.add_argument('--check-failures', action='store_true', default=False,
+                        help='Visualize images on which the model failed')
+    parser.add_argument('--kernels', action='store_true', default=False,
+                        help='Visualize the kernels for the first convolutional layer')
+    parser.add_argument('--confusion', action='store_true', default=False,
+                        help='Visualize the confusion matrix')
+    parser.add_argument('--feature-vectors', action='store_true', default=False,
+                        help='Visualize the high-dimensional embedding')
+    
+
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -175,7 +282,7 @@ def main():
         model = fcNet().to(device)
         model.load_state_dict(torch.load(args.load_model))
 
-        test_dataset = datasets.MNIST('../data', train=False,
+        test_dataset = datasets.MNIST('data', train=False,
                     transform=transforms.Compose([
                         transforms.ToTensor(),
                         transforms.Normalize((0.1307,), (0.3081,))
@@ -192,6 +299,9 @@ def main():
     train_dataset = datasets.MNIST('../data', train=True, download=True,
                 transform=transforms.Compose([       # Data preprocessing
                     transforms.ToTensor(),           # Add data augmentation here
+                    # transforms.RandomPerspective(),
+                    # transforms.GaussianBlur(3),
+                    # transforms.RandomAffine(0, (0.1, 0.1)),
                     transforms.Normalize((0.1307,), (0.3081,))
                 ]))
 
@@ -199,8 +309,15 @@ def main():
     # training by using SubsetRandomSampler. Right now the train and validation
     # sets are built from the same indices - this is bad! Change it so that
     # the training and validation sets are disjoint and have the correct relative sizes.
-    subset_indices_train = range(len(train_dataset))
-    subset_indices_valid = range(len(train_dataset))
+    subset_indices_train = np.random.choice(len(train_dataset), size=int(0.85*len(train_dataset)), replace=False)
+    subset_indices_valid = np.delete(np.arange(len(train_dataset)), subset_indices_train)
+
+    # Use only a fraction of the total training set.
+    subset_indices_train = np.random.choice(
+        subset_indices_train,
+        size=int(args.train_frac * subset_indices_train.shape[0]),
+        replace=False
+    )
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size,
@@ -211,26 +328,106 @@ def main():
         sampler=SubsetRandomSampler(subset_indices_valid)
     )
 
-    # Load your model [fcNet, ConvNet, Net]
-    model = ConvNet().to(device)
+    torch.utils.data.DataLoader
 
-    # Try different optimzers here [Adam, SGD, RMSprop]
+    # Load your model [fcNet, ConvNet, Net]
+    model = Net().to(device)
+
+    # Try different optimizers here [Adam, SGD, RMSprop]
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
     # Set your learning rate scheduler
     scheduler = StepLR(optimizer, step_size=args.step, gamma=args.gamma)
 
+
     # Training loop
+    train_accuracy = []
+    val_accuracy = []
+    kernels = []
     for epoch in range(1, args.epochs + 1):
         train(args, model, device, train_loader, optimizer, epoch)
-        test(model, device, val_loader)
+        train_accuracy.append(test(model, device, train_loader, method='train'))
+        val_accuracy.append(test(model, device, val_loader, method='val'))
         scheduler.step()    # learning rate scheduler
 
-        # You may optionally save your model at each epoch here
+        # Visualize the kernels
+        kernels.append(model.parameters().__next__()[np.random.randint(8)])
+
+    if args.kernels:
+        print(len(kernels))
+        f, axarr = plt.subplots(3, 3)
+        for i, k in enumerate(kernels[-9:]):
+            axarr[i // 3, i % 3].imshow(transforms.ToPILImage()(k))
+        plt.savefig('kernels.png', format='png')
+
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_model.pt")
 
+    # Print learning curves.
+    if args.plot_curves:
+        plt.figure()
+        plt.plot(range(1, args.epochs + 1), train_accuracy, label='Training')
+        plt.plot(range(1, args.epochs + 1), val_accuracy, label='Validation')
+        plt.legend()
+        plt.xlabel('Epochs')
+        plt.ylabel('Accuracy')
+        plt.title('Learning Curves')
+        plt.savefig('learning_curves.png', format='png')
+
+    # Visualize the failures.
+    if args.check_failures:
+        fails = test(model, device, val_loader, method='val', check_failures=True)[:9]
+        f, axarr = plt.subplots(3, 3)
+        for i, fail in enumerate(fails):
+            axarr[i // 3, i % 3].imshow(transforms.ToPILImage()(fail[0] * 0.3081 + 0.1307))
+            axarr[i // 3, i % 3].set_title(f'Prediction: {fail[1]}')
+        plt.savefig('missed_preds.png', format='png')
+
+    # Confusion
+    if args.confusion:
+        y_pred = []
+        y_true = []
+
+        for ims, target in val_loader:
+                preds = model(ims) # Feed Network
+
+                preds = (torch.max(torch.exp(preds), 1)[1]).data.cpu().numpy()
+                y_pred.extend(preds) # Save Prediction
+                
+                target = target.data.cpu().numpy()
+                y_true.extend(target) # Save Truth
+
+        # Build confusion matrix
+        cf_matrix = confusion_matrix(y_true, y_pred)
+        cf_matrix = cf_matrix / np.sum(cf_matrix) * 10
+        plt.figure()
+        seaborn.heatmap(cf_matrix, annot=True)
+        plt.savefig('confusion.png')
+
+    if args.feature_vectors:
+        vectors = np.empty((0, 64))
+        ims = []
+        for im, target in val_loader:
+            for i in range(im.shape[0]):
+                ims.append(im[i, :, :, :])
+            vectors = np.concatenate([vectors, model.get_feature_vector(im).detach().numpy()])
+
+        # X_embedded = TSNE(n_components=2, n_jobs=1, init='random').fit_transform(vectors)
+        # print(X_embedded.shape)
+
+        # Closest vectors
+        idx = np.random.choice(vectors.shape[0], size=4, replace=False)
+        xs = vectors[idx, :].reshape(1, 64, 4)
+        dist = np.sqrt(((np.repeat(vectors.reshape(9000, 64, 1), 4, axis=2) - xs) ** 2).sum(axis=1))
+        close_idx = np.broadcast_to(np.arange(9000), (4, 9000))[np.argsort(dist, axis=0).T < 8].reshape(4, 8)
+
+        f, axarr = plt.subplots(4, 9)
+        for k, i in enumerate(idx):
+            axarr[k, 0].imshow(transforms.ToPILImage()(ims[i]))
+            for j in range(8):
+                axarr[k, j+1].imshow(transforms.ToPILImage()(ims[close_idx[k, j]]))
+        plt.show()
 
 if __name__ == '__main__':
     main()
